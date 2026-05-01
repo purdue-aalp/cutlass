@@ -56,6 +56,10 @@
 
 
 #include <iostream>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <limits>
 #include <cuda_runtime.h>
 
 // -----------------------------------------------------------------------------
@@ -261,9 +265,16 @@ struct Options {
 
   Options():
     help(false),
-    m(5120), n(4096), k(4096),
+    // GPGPU-Sim default: a single TileShape (128x128) with K=128 (=4 K-tiles).
+    // Functional simulation runs every thread sequentially, so the stock 5120x
+    // 4096x4096 default would take days. The CUTLASS GEMM still dispatches a
+    // real warp-specialized Hopper kernel here, just on a single CTA.
+    m(128), n(128), k(128),
     alpha(1.f), beta(0.f),
-    iterations(1000),
+    // Skip the profiling loop by default. The correctness path runs gemm.run()
+    // exactly once and compares against the reference GEMM; replaying it 1000
+    // times only stresses the simulator without adding signal.
+    iterations(0),
     raster(RasterOrderOptions::Heuristic),
     swizzle(1)
   { }
@@ -359,25 +370,84 @@ struct Result
 /// GEMM setup and evaluation
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Helper to initialize a block of device data.
+/// Deterministic, well-conditioned initializer for the GEMM operands.
 ///
-/// NOTE: For GPGPU-Sim functional bring-up we replace the
-/// `BlockFillRandomUniform` device kernel (which fans out to ~33k threads
-/// running the xorwow skip-ahead matrix and is prohibitively slow under
-/// functional simulation) with a deterministic `cudaMemset`. This is fine
-/// because the goal of the sim_compat path is to demonstrate that the
-/// warp-specialized Hopper GEMM kernel reaches graceful completion under
-/// the simulator, not to validate numerical correctness against a reference.
+/// The stock CUTLASS example uses `BlockFillRandomUniform`, which fans out
+/// to ~33k threads running the xorwow skip-ahead matrix; that is prohibitive
+/// under functional simulation. Earlier sim_compat revisions worked around
+/// the cost by zero-filling, but that turns the GEMM result into a trivial
+/// zero buffer and makes verify() vacuous.
+///
+/// This initializer instead launches a tiny custom kernel that writes a
+/// purely index-derived pattern. The pattern is:
+///
+///     val(i) = float((i + bias) % MOD - HALF) / float(HALF)
+///
+/// with MOD=17 and HALF=8, giving values in roughly [-1, +1] in 1/8 steps.
+/// Properties:
+///   * Deterministic and reproducible across runs/seeds, which makes it easy
+///     to bisect simulator regressions.
+///   * Bounded magnitude so FP32 accumulation across K stays well below
+///     overflow even for moderate K extents.
+///   * Different `bias` per buffer (A vs B vs C) so the result is not a
+///     single constant tiled across the output, which makes the reference
+///     comparison sensitive to per-(m,n) errors rather than just a global
+///     magnitude check.
+///   * One thread per element (capped block size 256), which keeps the
+///     functional-sim launch cheap relative to the random PRNG kernel.
+// NOTE: keep this kernel in a *named* namespace. CUTLASS's cute headers use
+// their own anonymous namespace for some inline definitions, and adding a
+// second anonymous namespace at file scope here causes nvcc/cudafe to emit a
+// host stub that ambiguously references _GLOBAL__N__... between cute's
+// anonymous namespace and ours. Naming the namespace sidesteps the collision.
+namespace cutlass48_sim_compat {
+
+template <class Element>
+__global__ void pattern_fill(Element* dst, size_t n, uint32_t bias) {
+  size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= n) return;
+  // 32-bit arithmetic on purpose: a 64-bit `i % MOD` would lower to
+  // mul.hi.u64 (now implemented in this simulator), but a 32-bit modulo is
+  // strictly cheaper and avoids exercising additional simulator paths
+  // during initialization. The truncation of `idx` to u32 is fine because
+  // problem sizes here are <<< 2^32 elements.
+  uint32_t const MOD  = 17u;
+  int      const HALF = 8;
+  uint32_t i32 = static_cast<uint32_t>(idx) + bias;
+  int v = static_cast<int>(i32 % MOD) - HALF;  // [-8, +8]
+  dst[idx] = static_cast<Element>(static_cast<float>(v) / static_cast<float>(HALF));
+}
+
+}  // namespace cutlass48_sim_compat
+
 template <class Element>
 bool initialize_block(
   cutlass::DeviceAllocation<Element>& block,
-  uint64_t /*seed*/ = 2023) {
+  uint64_t seed = 2023) {
 
-  cudaError_t status = cudaMemset(block.get(), 0,
-                                  block.size() * sizeof(Element));
-  if (status != cudaSuccess) {
-    std::cerr << "cudaMemset failed in initialize_block: "
-              << cudaGetErrorString(status) << std::endl;
+  size_t const count = block.size();
+  if (count == 0) return true;
+
+  int const block_size = 256;
+  size_t const grid_size = (count + block_size - 1) / block_size;
+  // Seed contributes a per-buffer bias so block_A / block_B / block_C all get
+  // distinct patterns even though they share this single helper.
+  uint32_t bias = static_cast<uint32_t>(seed & 0xffffffffu);
+
+  cutlass48_sim_compat::pattern_fill<Element>
+      <<<static_cast<unsigned>(grid_size), block_size>>>(
+          block.get(), count, bias);
+
+  cudaError_t launch_err = cudaGetLastError();
+  if (launch_err != cudaSuccess) {
+    std::cerr << "cutlass48_sim_compat::pattern_fill launch failed: "
+              << cudaGetErrorString(launch_err) << std::endl;
+    return false;
+  }
+  cudaError_t sync_err = cudaDeviceSynchronize();
+  if (sync_err != cudaSuccess) {
+    std::cerr << "cutlass48_sim_compat::pattern_fill sync failed: "
+              << cudaGetErrorString(sync_err) << std::endl;
     return false;
   }
   return true;
@@ -426,15 +496,139 @@ typename Gemm::Arguments args_from_options(const Options &options)
 }
 
 bool verify(const Options &options) {
-  // For GPGPU-Sim functional bring-up the goal is to drive the
-  // warp-specialized Hopper GEMM kernel to graceful completion. The
-  // reference device GEMM and BlockCompareEqual kernels add a large amount
-  // of additional functional-sim work (and re-exercise unrelated PTX paths)
-  // without contributing to that goal. Skip verification on the simulator
-  // and just confirm the prior GEMM launch completed without error.
+  // Step 1 of the post-bring-up plan: actually validate numerical
+  // correctness against the reference device GEMM. The earlier sim_compat
+  // revision short-circuited this to a tautology so the kernel could reach
+  // graceful exit; now that the warp-specialized Hopper kernel runs
+  // end-to-end we want a real correctness check on a small problem.
+  cutlass::TensorRef ref_A(block_A.get(), Gemm::LayoutA::packed({options.m, options.k}));
+  cutlass::TensorRef ref_B(block_B.get(), Gemm::LayoutB::packed({options.k, options.n}));
+  cutlass::TensorRef ref_C(block_C.get(), Gemm::LayoutC::packed({options.m, options.n}));
+  cutlass::TensorRef ref_D(block_ref_D.get(), Gemm::LayoutD::packed({options.m, options.n}));
+
+  // Compute reference output using the basic CUTLASS device reference GEMM.
+  // This is a plain CUDA kernel (no Hopper-specific PTX), so it can run
+  // under functional simulation without exercising additional simulator
+  // bring-up paths.
+  DeviceGemmReference gemm_reference;
+  gemm_reference(
+    {options.m, options.n, options.k},
+    ElementAccumulator(options.alpha),
+    ref_A,
+    ref_B,
+    ElementAccumulator(options.beta),
+    ref_C,
+    ref_D);
+
   CUDA_CHECK(cudaDeviceSynchronize());
-  (void)options;
-  return true;
+
+  // Use a *relative* equality check rather than bit-exact.
+  //
+  // Even though both the CUTLASS Hopper kernel and the reference GEMM
+  // operate on FP32 tensors with FP32 accumulation, the warp-specialized
+  // path lowers to wgmma.mma_async tensor-core instructions which (on real
+  // hardware) accumulate via the TF32 mode and may differ from the strict
+  // FP32 reference at the last few mantissa bits. The simulator's
+  // functional wgmma model may approximate this differently, so a relative
+  // tolerance is the right comparison shape.
+  //
+  // For the 128x128x128 default this gives plenty of headroom while still
+  // catching meaningful divergence in the wgmma / mbarrier / TMA paths.
+  ElementC const epsilon(1e-3f);
+  ElementC const nonzero_floor(1e-3f);
+  bool passed = cutlass::reference::device::BlockCompareRelativelyEqual(
+      block_ref_D.get(), block_D.get(), block_D.size(),
+      epsilon, nonzero_floor);
+
+  if (!passed) {
+    // Diagnostic dump: copy back the input buffers (A, B, C) plus the two
+    // outputs so we can distinguish "pattern_fill did not actually run /
+    // produced garbage" from "GEMM output is wrong" from "wgmma rounding
+    // noise". The latter would manifest as small relative deltas; the
+    // former manifests as structurally wrong values (zeros, NaNs, or a
+    // single value tiled across the whole buffer).
+    size_t const total   = block_D.size();
+    size_t const a_total = block_A.size();
+    size_t const b_total = block_B.size();
+    size_t const c_total = block_C.size();
+    size_t const dump    = total < 16 ? total : 16;
+
+    std::vector<ElementA> a_host(a_total);
+    std::vector<ElementB> b_host(b_total);
+    std::vector<ElementC> c_host(c_total);
+    std::vector<ElementC> got(total), ref(total);
+    cudaMemcpy(a_host.data(), block_A.get(),    a_total * sizeof(ElementA), cudaMemcpyDeviceToHost);
+    cudaMemcpy(b_host.data(), block_B.get(),    b_total * sizeof(ElementB), cudaMemcpyDeviceToHost);
+    cudaMemcpy(c_host.data(), block_C.get(),    c_total * sizeof(ElementC), cudaMemcpyDeviceToHost);
+    cudaMemcpy(got.data(),    block_D.get(),    total   * sizeof(ElementC), cudaMemcpyDeviceToHost);
+    cudaMemcpy(ref.data(),    block_ref_D.get(), total  * sizeof(ElementC), cudaMemcpyDeviceToHost);
+
+    auto summarize = [](const char* name, auto const& v) {
+      size_t n = v.size();
+      size_t nans = 0, infs = 0, zeros = 0;
+      double mn = std::numeric_limits<double>::infinity();
+      double mx = -std::numeric_limits<double>::infinity();
+      for (size_t i = 0; i < n; ++i) {
+        float x = static_cast<float>(v[i]);
+        if (std::isnan(x)) { ++nans; continue; }
+        if (std::isinf(x)) { ++infs; continue; }
+        if (x == 0.0f) ++zeros;
+        if (x < mn) mn = x;
+        if (x > mx) mx = x;
+      }
+      std::cerr << "  " << name << " n=" << n
+                << " nans=" << nans << " infs=" << infs
+                << " zeros=" << zeros
+                << " min=" << mn << " max=" << mx << "\n";
+    };
+    summarize("A     ", a_host);
+    summarize("B     ", b_host);
+    summarize("C     ", c_host);
+    summarize("D     ", got);
+    summarize("ref_D ", ref);
+    std::cerr << "  first " << dump << " of A: ";
+    for (size_t i = 0; i < dump; ++i) std::cerr << static_cast<float>(a_host[i]) << ' ';
+    std::cerr << "\n  first " << dump << " of B: ";
+    for (size_t i = 0; i < dump; ++i) std::cerr << static_cast<float>(b_host[i]) << ' ';
+    std::cerr << "\n  first " << dump << " of C: ";
+    for (size_t i = 0; i < dump; ++i) std::cerr << static_cast<float>(c_host[i]) << ' ';
+    std::cerr << "\n";
+
+    size_t mismatches = 0;
+    double max_abs_diff = 0.0;
+    double max_rel_diff = 0.0;
+    size_t worst_idx = 0;
+    size_t nan_count = 0;
+    size_t zero_got_nonzero_ref = 0;
+    for (size_t i = 0; i < total; ++i) {
+      float g = static_cast<float>(got[i]);
+      float r = static_cast<float>(ref[i]);
+      if (std::isnan(g) || std::isnan(r)) { ++nan_count; ++mismatches; continue; }
+      double a = std::fabs(static_cast<double>(g) - static_cast<double>(r));
+      double denom = std::max<double>(std::fabs(r), 1e-3);
+      double rel = a / denom;
+      bool eq = (a < 1e-3) || (rel < 1e-3);
+      if (!eq) {
+        ++mismatches;
+        if (a > max_abs_diff) { max_abs_diff = a; max_rel_diff = rel; worst_idx = i; }
+      }
+      if (g == 0.0f && r != 0.0f) ++zero_got_nonzero_ref;
+    }
+    std::cerr << "  verify: " << mismatches << "/" << total
+              << " mismatched elements (epsilon=1e-3)\n"
+              << "  worst |got-ref| = " << max_abs_diff
+              << " (rel=" << max_rel_diff << ") at flat idx=" << worst_idx
+              << " got=" << static_cast<float>(got[worst_idx])
+              << " ref=" << static_cast<float>(ref[worst_idx]) << "\n"
+              << "  NaNs: " << nan_count
+              << ", got==0 while ref!=0: " << zero_got_nonzero_ref << "\n";
+    std::cerr << "  first " << dump << " (got | ref):\n";
+    for (size_t i = 0; i < dump; ++i) {
+      std::cerr << "    [" << i << "] " << static_cast<float>(got[i])
+                << " | " << static_cast<float>(ref[i]) << "\n";
+    }
+  }
+  return passed;
 }
 
 /// Execute a given example GEMM computation
