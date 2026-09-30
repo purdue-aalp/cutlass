@@ -74,7 +74,7 @@
 //      elect_one_leader_sync() no longer lower to elect.sync. Instead, one
 //      active lane per warp is chosen via __activemask() and __ffs(), which
 //      keeps the "exactly one active lane" behavior even in diverged regions.
-//   2. CUTLASS_SIM_DISABLE_SETMAXNREG=1 (default 1):
+//   2. CUTLASS_SIM_DISABLE_SETMAXNREG=1 (default 0):
 //      cutlass::arch::warpgroup_reg_alloc/dealloc() are compiled as no-ops by
 //      forcing CUDA_CTA_RECONFIG_ACTIVATED=0 before CUTLASS pulls in
 //      cutlass/arch/reg_reconfig.h. This removes setmaxnreg.{inc,dec} PTX while
@@ -82,7 +82,7 @@
 // -----------------------------------------------------------------------------
 
 #ifndef CUTLASS_SIM_DISABLE_SETMAXNREG
-#define CUTLASS_SIM_DISABLE_SETMAXNREG 1
+#define CUTLASS_SIM_DISABLE_SETMAXNREG 0
 #endif
 
 #if CUTLASS_SIM_DISABLE_SETMAXNREG
