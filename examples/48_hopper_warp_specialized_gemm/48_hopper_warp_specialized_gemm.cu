@@ -60,6 +60,8 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <random>
+#include <string>
 #include <cuda_runtime.h>
 
 // -----------------------------------------------------------------------------
@@ -262,6 +264,14 @@ struct Options {
   int m, n, k;
   RasterOrderOptions raster;
   int swizzle;
+  // Operand init: "pattern" (pattern_fill kernel) or "random" (host-side
+  // uniform fill matching upstream BlockFillRandomUniform(8, -8, 0)).
+  std::string init;
+  int seed;
+  // Reference check: "device" (reference GEMM kernel) or "host" (double
+  // accumulation on the host, so only the CUTLASS GEMM runs in the sim).
+  std::string verify;
+  double rel_eps, abs_eps, eps_floor;
 
   Options():
     help(false),
@@ -276,7 +286,9 @@ struct Options {
     // times only stresses the simulator without adding signal.
     iterations(0),
     raster(RasterOrderOptions::Heuristic),
-    swizzle(1)
+    swizzle(1),
+    init("pattern"), seed(0),
+    rel_eps(1e-3), abs_eps(1e-4), eps_floor(1.0)
   { }
 
   // Parses the command line
@@ -309,6 +321,14 @@ struct Options {
     }
 
     cmd.get_cmd_line_argument("swizzle", swizzle, 1);
+
+    cmd.get_cmd_line_argument("init", init, std::string("pattern"));
+    cmd.get_cmd_line_argument("seed", seed, 0);
+    cmd.get_cmd_line_argument("verify", verify,
+                              std::string(init == "random" ? "host" : "device"));
+    cmd.get_cmd_line_argument("rel_eps", rel_eps, 1e-3);
+    cmd.get_cmd_line_argument("abs_eps", abs_eps, 1e-4);
+    cmd.get_cmd_line_argument("eps_floor", eps_floor, 1.0);
   }
 
   /// Prints the usage statement.
@@ -325,7 +345,13 @@ struct Options {
       << "  --beta=<f32>                Epilogue scalar beta\n\n"
       << "  --raster=<char>             CTA Rasterization direction (N for along N, M for along M, and H for heuristic)\n\n"
       << "  --swizzle=<int>             CTA Rasterization swizzle\n\n"
-      << "  --iterations=<int>          Number of profiling iterations to perform.\n\n";
+      << "  --iterations=<int>          Number of profiling iterations to perform.\n\n"
+      << "  --init=<pattern|random>     Operand init: pattern_fill kernel, or host uniform ints in [-8,8]\n"
+      << "  --seed=<int>                Random init seed (A/B/C use seed+2023/2022/2021)\n"
+      << "  --verify=<device|host>      Reference GEMM on device, or on host in double (default: host for random)\n"
+      << "  --rel_eps=<f64>             Host verify relative tolerance (default 1e-3)\n"
+      << "  --abs_eps=<f64>             Host verify absolute tolerance (default 1e-4)\n"
+      << "  --eps_floor=<f64>           Host verify floor on |ref| for the relative error (default 1.0)\n\n";
 
     out
       << "\n\nExamples:\n\n"
@@ -453,6 +479,34 @@ bool initialize_block(
   return true;
 }
 
+/// Host-side equivalent of upstream's
+/// `BlockFillRandomUniform(ptr, n, seed, /*max=*/8, /*min=*/-8, /*bits=*/0)`:
+/// the same value mapping (llround(max - range * u)), so integers in [-8, 8]
+/// with the endpoints at half weight, but drawn from std::mt19937 on the host
+/// and copied over. The device fill runs ~33k curand skip-ahead threads,
+/// which takes hours per buffer under simulation.
+template <class Element>
+bool initialize_block_host(
+  cutlass::DeviceAllocation<Element>& block,
+  uint64_t seed) {
+
+  double const max = 8, range = 16;
+  std::mt19937 rng(static_cast<uint32_t>(seed));
+  std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+  std::vector<Element> host(block.size());
+  for (auto &x : host) {
+    x = static_cast<Element>(static_cast<float>(std::llround(max - range * dist(rng))));
+  }
+  cudaError_t err = cudaMemcpy(block.get(), host.data(), host.size() * sizeof(Element),
+                               cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    std::cerr << "initialize_block_host memcpy failed: " << cudaGetErrorString(err) << std::endl;
+    return false;
+  }
+  return true;
+}
+
 /// Initialize operands to be used in the GEMM and reference GEMM
 void initialize(const Options &options) {
 
@@ -467,9 +521,17 @@ void initialize(const Options &options) {
   block_D.reset(options.m * options.n);
   block_ref_D.reset(options.m * options.n);
 
-  initialize_block(block_A, seed + 2023);
-  initialize_block(block_B, seed + 2022);
-  initialize_block(block_C, seed + 2021);
+  seed = options.seed;
+  if (options.init == "random") {
+    initialize_block_host(block_A, seed + 2023);
+    initialize_block_host(block_B, seed + 2022);
+    initialize_block_host(block_C, seed + 2021);
+  }
+  else {
+    initialize_block(block_A, seed + 2023);
+    initialize_block(block_B, seed + 2022);
+    initialize_block(block_C, seed + 2021);
+  }
 }
 
 /// Populates a Gemm::Arguments structure from the given commandline options
@@ -495,7 +557,53 @@ typename Gemm::Arguments args_from_options(const Options &options)
   return arguments;
 }
 
+/// Host reference GEMM (double accumulation) and element-wise comparison.
+/// A is MxK row-major, B is KxN column-major, C and D are MxN column-major.
+bool verify_host(const Options &options) {
+  int const M = options.m, N = options.n, K = options.k;
+  std::vector<ElementA> a(block_A.size());
+  std::vector<ElementB> b(block_B.size());
+  std::vector<ElementC> c(block_C.size()), d(block_D.size());
+  CUDA_CHECK(cudaMemcpy(a.data(), block_A.get(), a.size() * sizeof(ElementA), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(b.data(), block_B.get(), b.size() * sizeof(ElementB), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(c.data(), block_C.get(), c.size() * sizeof(ElementC), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(d.data(), block_D.get(), d.size() * sizeof(ElementC), cudaMemcpyDeviceToHost));
+
+  size_t exact = 0, outside = 0, worst = 0;
+  double max_abs = 0, max_rel = 0, worst_ref = 0;
+  for (int n = 0; n < N; ++n) {
+    for (int m = 0; m < M; ++m) {
+      double acc = 0;
+      for (int k = 0; k < K; ++k) {
+        acc += double(float(a[size_t(m) * K + k])) * double(float(b[k + size_t(n) * K]));
+      }
+      size_t i = m + size_t(n) * M;
+      double ref = double(options.alpha) * acc + double(options.beta) * double(float(c[i]));
+      double got = double(float(d[i]));
+      double abs_err = std::fabs(got - ref);
+      double rel_err = abs_err / std::max(std::fabs(ref), options.eps_floor);
+      if (float(got) == float(ref)) ++exact;
+      if (!(abs_err <= options.abs_eps || rel_err <= options.rel_eps)) ++outside;
+      if (i == 0 || abs_err > max_abs || std::isnan(abs_err)) { max_abs = abs_err; worst = i; worst_ref = ref; }
+      max_rel = std::max(max_rel, rel_err);
+    }
+  }
+
+  size_t const total = d.size();
+  std::cout << "  Verify (host, double ref): exact " << exact << "/" << total
+            << ", outside eps " << outside << "/" << total
+            << " (rel_eps=" << options.rel_eps << " abs_eps=" << options.abs_eps
+            << " floor=" << options.eps_floor << ")\n"
+            << "  max_abs_err=" << max_abs << " max_rel_err=" << max_rel
+            << " worst at (m=" << worst % M << ", n=" << worst / M << ")"
+            << " D=" << float(d[worst]) << " ref=" << worst_ref << std::endl;
+  return outside == 0;
+}
+
 bool verify(const Options &options) {
+  if (options.verify == "host") {
+    return verify_host(options);
+  }
   // Step 1 of the post-bring-up plan: actually validate numerical
   // correctness against the reference device GEMM. The earlier sim_compat
   // revision short-circuited this to a tautology so the kernel could reach
