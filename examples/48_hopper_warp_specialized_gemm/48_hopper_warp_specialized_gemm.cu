@@ -68,13 +68,14 @@
 // Simulator compatibility shims
 // -----------------------------------------------------------------------------
 // This translation unit preserves the original CUTLASS Hopper warp-specialized
-// kernel selection, but replaces two PTX features that some simulators do not
-// implement:
-//   1. cute::elect_one_sync() / elect_one_leader_sync() no longer lower to
-//      elect.sync. Instead, one active lane per warp is chosen via
-//      __activemask() and __ffs(), which keeps the "exactly one active lane"
-//      behavior even in diverged regions.
-//   2. cutlass::arch::warpgroup_reg_alloc/dealloc() are compiled as no-ops by
+// kernel selection, but can replace two PTX features that some simulators do
+// not implement:
+//   1. CUTLASS_SIM_DISABLE_ELECT_SYNC=1 (default 0): cute::elect_one_sync() /
+//      elect_one_leader_sync() no longer lower to elect.sync. Instead, one
+//      active lane per warp is chosen via __activemask() and __ffs(), which
+//      keeps the "exactly one active lane" behavior even in diverged regions.
+//   2. CUTLASS_SIM_DISABLE_SETMAXNREG=1 (default 1):
+//      cutlass::arch::warpgroup_reg_alloc/dealloc() are compiled as no-ops by
 //      forcing CUDA_CTA_RECONFIG_ACTIVATED=0 before CUTLASS pulls in
 //      cutlass/arch/reg_reconfig.h. This removes setmaxnreg.{inc,dec} PTX while
 //      leaving the surrounding control flow unchanged.
@@ -91,7 +92,7 @@
 #endif
 
 #ifndef CUTLASS_SIM_DISABLE_ELECT_SYNC
-#define CUTLASS_SIM_DISABLE_ELECT_SYNC 1
+#define CUTLASS_SIM_DISABLE_ELECT_SYNC 0
 #endif
 
 #if CUTLASS_SIM_DISABLE_ELECT_SYNC
