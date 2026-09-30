@@ -183,7 +183,6 @@ using ArchTag             = cutlass::arch::Sm90;                            // T
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
 using TileShape           = Shape<_128,_128,_32>;                           // Threadblock-level tile size
 using ClusterShape        = Shape<_1,_1,_1>;                                // GeForce Blackwell does not support TMA multicast
-using StageCountType = cutlass::gemm::collective::StageCount<2>;            // Constrain pipeline stages to fit GeForce Blackwell shared memory
 using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;       // Kernel to launch based on the default setting in the Collective Builder
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -202,7 +201,8 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     ElementB, LayoutB, AlignmentB,
     ElementAccumulator,
     TileShape, ClusterShape,
-    StageCountType,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
     cutlass::gemm::collective::KernelScheduleAuto
   >::CollectiveOp;
 
