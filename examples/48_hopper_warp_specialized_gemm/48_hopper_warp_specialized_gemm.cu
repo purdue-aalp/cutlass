@@ -182,7 +182,7 @@ using ElementAccumulator  = float;                                          // E
 using ArchTag             = cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
 using TileShape           = Shape<_128,_128,_32>;                           // Threadblock-level tile size
-using ClusterShape        = Shape<_1,_1,_1>;                                // GeForce Blackwell does not support TMA multicast
+using ClusterShape        = Shape<_2,_1,_1>;                                // Shape of the threadblocks in a cluster
 using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;       // Kernel to launch based on the default setting in the Collective Builder
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
